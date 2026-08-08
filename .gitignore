@@ -1,0 +1,25 @@
+# Local toolchain (SDK / JDK / Gradle) — 2.2 GB, machine-specific, never commit.
+toolchain/
+.toolchain/
+
+# Gradle + build caches
+.gradle/
+build/
+app/build/
+
+# Local SDK path (machine-specific)
+local.properties
+
+# Release signing (keep the keystore + passwords out of version control!)
+release.keystore
+release-signing.properties
+
+# Misc local artifacts
+build.log
+_maven.pom
+*.iml
+.idea/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

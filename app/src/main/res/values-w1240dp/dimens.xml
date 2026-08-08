@@ -1,0 +1,9 @@
+<resources>
+    <!-- Foldable (VIVO X Fold3 pro unfolded 2480x2200): larger targets & more columns -->
+    <dimen name="file_item_min_width">260dp</dimen>
+    <dimen name="app_bar_height">72dp</dimen>
+    <dimen name="text_title">22sp</dimen>
+    <dimen name="text_body">16sp</dimen>
+    <dimen name="padding_std">18dp</dimen>
+    <dimen name="fab_size">64dp</dimen>
+</resources>

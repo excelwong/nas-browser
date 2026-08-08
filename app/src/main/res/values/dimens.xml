@@ -1,0 +1,9 @@
+<resources>
+    <!-- Base dimensions for phones -->
+    <dimen name="file_item_min_width">300dp</dimen>
+    <dimen name="app_bar_height">56dp</dimen>
+    <dimen name="text_title">18sp</dimen>
+    <dimen name="text_body">14sp</dimen>
+    <dimen name="padding_std">12dp</dimen>
+    <dimen name="fab_size">56dp</dimen>
+</resources>

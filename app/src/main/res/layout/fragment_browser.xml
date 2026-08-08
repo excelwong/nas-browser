@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:orientation="vertical"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+
+    <!-- Top app bar -->
+    <LinearLayout
+        android:orientation="horizontal"
+        android:background="?attr/colorPrimary"
+        android:gravity="center_vertical"
+        android:paddingStart="@dimen/padding_std"
+        android:paddingEnd="@dimen/padding_std"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/app_bar_height">
+
+        <ImageButton
+            android:id="@+id/btnUp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_arrow_up"
+            android:contentDescription="@string/up_directory"
+            android:layout_width="48dp"
+            android:layout_height="48dp" />
+
+        <TextView
+            android:id="@+id/tvPath"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/title_browser"
+            android:textColor="@color/white"
+            android:textSize="@dimen/text_title"
+            android:ellipsize="start"
+            android:singleLine="true"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp" />
+
+        <ImageButton
+            android:id="@+id/btnRefresh"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_refresh"
+            android:contentDescription="@string/refresh"
+            android:layout_width="48dp"
+            android:layout_height="48dp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSettings"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/settings"
+            android:textColor="@color/white"
+            style="@style/Widget.MaterialComponents.Button.TextButton" />
+    </LinearLayout>
+
+    <ProgressBar
+        android:id="@+id/progress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:indeterminate="true"
+        android:visibility="gone" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recycler"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:padding="@dimen/padding_std"
+        android:scrollbars="vertical" />
+
+    <TextView
+        android:id="@+id/tvEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:text="@string/empty_folder"
+        android:textSize="@dimen/text_title"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <!-- Bottom action bar -->
+    <LinearLayout
+        android:orientation="horizontal"
+        android:background="?attr/colorSurface"
+        android:gravity="center_vertical"
+        android:padding="@dimen/padding_std"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnUpBottom"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/up_directory"
+            app:icon="@drawable/ic_arrow_up"
+            style="@style/Widget.MaterialComponents.Button" />
+
+        <TextView
+            android:id="@+id/tvSelected"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/selected_count"
+            android:textSize="@dimen/text_body" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnTransfers"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/open_transfers"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:visibility="gone" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnDownload"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_download"
+            android:enabled="false"
+            app:icon="@drawable/ic_download"
+            style="@style/Widget.MaterialComponents.Button" />
+    </LinearLayout>
+
+</LinearLayout>

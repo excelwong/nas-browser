@@ -1,0 +1,24 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+//
+// The Gradle Plugin Portal (plugins.gradle.org) is unreachable in this build
+// environment, so we cannot use the `plugins {}` DSL. Instead we declare AGP
+// and the Kotlin Gradle plugin via the classic `buildscript` classpath and
+// apply them with `apply plugin:` in app/build.gradle. Both artifacts resolve
+// from Google Maven + Maven Central, which ARE reachable here.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.5.2"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.23"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}

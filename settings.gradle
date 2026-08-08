@@ -1,0 +1,22 @@
+// NOTE: The Gradle Plugin Portal (plugins.gradle.org) is unreachable in this
+// build environment (returns 404 for plugin markers), so plugins are applied
+// via the classic `buildscript` classpath mechanism in build.gradle instead of
+// the `plugins {}` DSL. Repositories are restricted to Google Maven + Maven
+// Central, both of which ARE reachable here.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "NasBrowser"
+include(":app")

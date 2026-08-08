@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Media prepared for external playback lives under <external-files>/.nasopen -->
+    <external-files-path
+        name="nasopen"
+        path=".nasopen" />
+</paths>
