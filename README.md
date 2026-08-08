@@ -1,5 +1,7 @@
 # NAS 浏览器 (NAS Browser) — 安卓客户端
 
+> 当前版本 **v1.0.0** · 发布 APK：<https://github.com/excelwong/nas-browser/releases/download/v1.0.0/app-release.apk>
+
 在安卓手机上浏览局域网 NAS 的 SMB 共享目录，多选文件/目录并下载到本机 **Download** 目录。
 针对 **VIVO X Fold3 pro 折叠屏**（展开分辨率 2480×2200）做了网格自适应布局。
 
@@ -26,80 +28,101 @@ NAS 开启了 SMB1–3 与 NFS v2–v4.1，但**原厂安卓（含 VIVO 定制�
 - **本机存储**：下载到 `内部存储/Download/NasFiles/<选中目录名>/...`（只保留选中目录及其子目录，不含共享名与上级路径）。Android 10+ 走 MediaStore，**无需存储权限**。
 - **折叠屏适配**：文件网格列数随屏宽自适应（展开 2480px 多列铺满），`values-w1240dp` 提供更大触控目标。
 
-### 本次新增的增强
+### 连接配置持久化（记住密码）
 
-1. **连接配置持久化（记住密码）**
-   - 连接页新增「记住密码」勾选框（默认勾选）。
-   - 凭据保存在 **EncryptedSharedPreferences**（AndroidKeyStore 背书、AES 加密），
-     密码不以明文落盘；设备不支持密钥库时回退到普通 SharedPreferences。
-   - 下次打开自动回填主机 / 共享名 / 用户名 / 密码。
+- 连接页提供「记住密码」勾选框（默认勾选）。
+- 凭据保存在 **EncryptedSharedPreferences**（AndroidKeyStore 背书、AES 加密），密码不以明文落盘；
+  设备不支持密钥库时回退到普通 SharedPreferences。
+- 代码与文档中**不包含任何 NAS 地址 / 目录 / 账号 / 密码**等个人信息；首次打开连接页需手动填写，
+  连接成功后保存在本机，下次自动回填。
+- 浏览页右上角「设置」菜单可**编辑连接**（回填后修改重连）或**清除配置**（清空凭据，便于切换 NAS）。
 
-2. **下载并发加速（多线程拉多个文件）**
-   - 内置大小为 **3** 的线程池，最多同时下载 3 个文件。
-   - 维护一个同等大小的 **SMB 连接池**（`SmbConnectionPool`），每个下载线程独占一条
-     已认证的 SMB 会话，互不争用，真正并行拉取。
+### 并发下载 + 断点续传
 
-3. **大文件断点续传**
-   - 下载先写入应用私有目录下的临时文件 `.../Download/.nasparts/<相对路径>.part`
-     （真实可定位文件，支持任意字节偏移的续写）。
-   - 开始下载前若检测到 `.part` 已存在，则从已有长度处 `SMB read(offset)` 继续，
-     **不重头下载**。
-   - 传输列表以 JSON 持久化；App 被杀后重连，点「继续/重试」即可从未完成处续传。
-   - 传输中可「取消」（保留 `.part`，状态变为「已暂停」，可继续）。
-   - 文件完整下载后，才从临时文件移动到公共 Download 目录（MediaStore）。
+- 下载引擎跑在一个**独立前台服务 `DownloadService`** 里：自带大小为 **4** 的线程池，
+  最多同时下载 4 个文件；并维护一个同等大小（4）的 **SMB 连接池**（`SmbConnectionPool`），
+  每个下载线程独占一条已认证的 SMB 会话，互不争用，真正并行拉取。
+- 下载先写入应用私有目录临时文件 `.../Download/.nasparts/<相对路径>.part`（真实可定位，支持任意字节偏移续写）。
+  若检测到 `.part` 已存在，则从已有长度处 `SMB read(offset)` 继续，**不重头下载**。
+- 传输列表以 JSON 持久化。进程被杀后重连，点「继续 / 重试」即可从未完成处续传；
+  传输中可「取消」（保留 `.part`，状态变「已暂停」，可继续）。
+- 文件完整下载后，才从临时文件移动到公共 Download 目录（MediaStore）。
 
-### 本次修复与架构调整（后台下载 + 不再线程乱套）
+### 为什么切后台不再「线程乱套」
 
-1. **下载搬进前台服务（`DownloadService`）**
-   - 下载引擎（SMB 连接池 + 下载线程池 + 续传逻辑）从 `BrowserViewModel` 整体移到了一个独立的前台服务里。
-   - 下载连接池与「浏览」连接池**完全分离**：之前二者共用同一个池，切后台后再回来时 UI 重新列目录会 `reconnect()` 把下载线程正在用的连接关掉，于是「多个线程乱套」。现在浏览重连只影响浏览，绝不会波及后台下载。
+- 之前下载线程与「浏览」共用同一个 SMB 连接池，切到别的 App 再切回来时 UI 重新列目录会 `reconnect()`
+  把下载线程正在用的连接关掉，于是多个下载线程互相踩踏。
+- 现在下载连接池与浏览连接池**完全分离**，浏览重连绝不会波及后台下载；下载在切 App、甚至进程被系统
+  回收后重连都能继续，状态栏常驻通知显示整体进度。
+- 重连走**协调式重建**：连接池用 `AtomicReference` 持有，重建经 `synchronized` + 双重检查 ——
+  同一时刻**只有一个线程**真正重建池，其余检测到连接过期的线程直接复用这次结果并重试，
+  不再各自 `reconnect()` 造成雪崩。
 
-2. **重连不再踩踏（协调式重建）**
-   - 连接池引用用 `AtomicReference` 持有，重建走 `synchronized` + 双重检查：同一时刻**只有一个线程**会真正重建池；其余检测到连接过期的线程直接复用这次重建结果并重试，不再各自去 `reconnect()` 造成雪崩 / 把别人手里的连接关掉。
+### 应用内打开 NAS 上的图片 / 视频
 
-3. **真正的后台 + 断点续传**
-   - 前台服务保证切 App、甚至进程被系统回收后重连，传输都能继续；传输列表以 JSON 持久化，重连后「继续 / 重试」从未完成处续传。
-   - 「下载选中」只认 `visibleSelection`（当前共享 + 当前目录的直接子项），跨目录选择不会被带入批次。
+- 图片、视频文件行尾出现「播放 / 打开」按钮。
+- 点击后先下载到本机应用私有缓存（`.nasopen`），再用系统默认的图片 / 视频应用打开播放，
+  **不依赖任何第三方播放器**（若本机没有对应查看器会提示「未找到可播放该文件的应用」）。
 
-### 本次新增的功能（第二版）
+---
 
-1. **连接信息不再预填，首次使用手动填写**
-   - 代码与文档中**不再包含任何 NAS 地址 / 目录 / 账号 / 密码**等个人信息。
-   - 首次打开连接页，主机 / 共享名 / 用户名 / 密码均为空，需用户自行填写；连接成功后保存在本机。
+## 下载已发布版本
 
-2. **可在 App 内修改 / 清除连接配置**
-   - 浏览页右上角「设置」菜单提供：
-     - **编辑连接**：返回连接页（自动回填已保存的信息），可修改后重新连接。
-     - **清除配置**：清空本机保存的凭据，返回空白连接页，便于切换到另一台 NAS。
+已签名的发布 APK 可在 GitHub Release 直接获取（无需自行构建）：
 
-3. **直接播放 / 打开 NAS 上的图片与视频**
-   - 图片、视频文件行尾出现「播放 / 打开」按钮。
-   - 点击后会先下载到本机应用私有缓存（`.nasopen`），再通过系统默认的图片 / 视频应用打开播放，
-     **不依赖任何第三方播放器**（若本机没有对应查看器会提示「未找到可播放该文件的应用」）。
+- **v1.0.0**（最新稳定版）：<https://github.com/excelwong/nas-browser/releases/download/v1.0.0/app-release.apk>
+- 发布页：<https://github.com/excelwong/nas-browser/releases/tag/v1.0.0>
 
 ---
 
 ## 如何构建
 
+> **Gradle 版本要求**：本工程的 Android Gradle Plugin 需要 **Gradle ≥ 8.7**。
+> 注意仓库里的 `gradle-wrapper.properties` 与 `.toolchain/install_build.sh` 当前仍写的是 **Gradle 8.6**，
+> 直接用它编译会报 “AGP requires Gradle ≥ 8.7” 而失败。请用下面「方式 B」里的本地 Gradle 8.9，
+> 或先把脚本 / wrapper 里的版本号改为 8.9。
+
 ### 方式 A：Android Studio（推荐，约 2 分钟）
 1. `File → Open` 选择本目录 `nas-browser`。
-2. 等待 Gradle 同步完成。
+2. 等待 Gradle 同步完成（若 wrapper 是 8.6，请在 `gradle-wrapper.properties` 改为 8.9 再同步）。
 3. 手机开启「USB 调试」后用 ▶ Run 安装到 VIVO X Fold3 pro。
 
-### 方式 B：命令行（仓库内已附带离线构建脚本）
-仓库内的 `.toolchain/install_build.sh` 会自动下载 JDK17 + Gradle 8.6 + Android SDK
-（`platform-35` / `build-tools;34.0.0` / `platform-tools`），接受许可，并产出 debug APK：
+### 方式 B：命令行（仓库内已附带离线工具链）
+本仓库根目录的 `toolchain/` 已内置 **JDK 17 + Gradle 8.9 + Android SDK**（`platform-35` /
+`build-tools;34.0.0` / `platform-tools`），无需联网即可构建。离线构建示例：
+
 ```bash
-bash nas-browser/.toolchain/install_build.sh
+# 用本地 Gradle 8.9（不要用 wrapper 的 8.6）
+export JAVA_HOME="$PWD/toolchain/jdk/jdk-17.0.20+8"
+export GRADLE_USER_HOME="$PWD/../.gradle"   # 或你的 Gradle 缓存目录
+export PATH="$JAVA_HOME/bin:$PATH"
+"$PWD/toolchain/gradle-8.9/bin/gradle.bat" --offline assembleDebug
 # 产物: app/build/outputs/apk/debug/app-debug.apk
 ```
+
+### 构建正式发布版（签名 APK）
+
+发布版会走 `signingConfigs.release`：读取仓库根目录的 **`release-signing.properties`**
+（含 `storeFile` / `storePassword` / `keyAlias` / `keyPassword`，**已被 `.gitignore` 排除，不入库**）。
+首次发布前需先生成自己的 keystore：
+
+```bash
+keytool -genkeypair -v -keystore release.keystore -alias nasbrowser \
+  -keyalg RSA -keysize 2048 -validity 10000
+# 然后新建 release-signing.properties 填入上面的四项；之后：
+"$PWD/toolchain/gradle-8.9/bin/gradle.bat" --offline assembleRelease
+# 产物: app/build/outputs/apk/release/app-release.apk（已签名，V1/V2/V3）
+```
+
+> 升级 App 必须使用同一个 `release.keystore`，请妥善备份 `release.keystore` 与 `release-signing.properties`。
 
 ---
 
 ## 安装到手机
 
 ```bash
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/release/app-release.apk   # 正式版
+# 或：adb install -r app/build/outputs/apk/debug/app-debug.apk  # 调试版
 ```
 VIVO 需先开启：设置 → 系统管理 → 关于手机 → 连续点击「软件版本号」开启开发者选项 →
 开启「USB 调试」；首次侧载若提示「禁止安装未知应用」，按提示允许本次安装。
