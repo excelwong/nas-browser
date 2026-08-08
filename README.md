@@ -78,9 +78,7 @@ NAS 开启了 SMB1–3 与 NFS v2–v4.1，但**原厂安卓（含 VIVO 定制�
 ## 如何构建
 
 > **Gradle 版本要求**：本工程的 Android Gradle Plugin 需要 **Gradle ≥ 8.7**。
-> 注意仓库里的 `gradle-wrapper.properties` 与 `.toolchain/install_build.sh` 当前仍写的是 **Gradle 8.6**，
-> 直接用它编译会报 “AGP requires Gradle ≥ 8.7” 而失败。请用下面「方式 B」里的本地 Gradle 8.9，
-> 或先把脚本 / wrapper 里的版本号改为 8.9。
+> 仓库里自带的 `gradle-wrapper.properties` 与 `.toolchain/install_build.sh` 已统一为 **Gradle 8.9**，可直接使用。
 
 ### 方式 A：Android Studio（推荐，约 2 分钟）
 1. `File → Open` 选择本目录 `nas-browser`。
@@ -92,7 +90,7 @@ NAS 开启了 SMB1–3 与 NFS v2–v4.1，但**原厂安卓（含 VIVO 定制�
 `build-tools;34.0.0` / `platform-tools`），无需联网即可构建。离线构建示例：
 
 ```bash
-# 用本地 Gradle 8.9（不要用 wrapper 的 8.6）
+# 用本地 Gradle 8.9（仓库自带，离线可用）
 export JAVA_HOME="$PWD/toolchain/jdk/jdk-17.0.20+8"
 export GRADLE_USER_HOME="$PWD/../.gradle"   # 或你的 Gradle 缓存目录
 export PATH="$JAVA_HOME/bin:$PATH"
