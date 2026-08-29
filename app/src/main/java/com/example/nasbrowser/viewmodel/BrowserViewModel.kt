@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.nasbrowser.DownloadService
+import com.example.nasbrowser.CancelHub
 import com.example.nasbrowser.model.ConnectionParams
 import com.example.nasbrowser.model.SortMode
 import com.example.nasbrowser.model.TransferItem
@@ -497,20 +498,58 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun deleteTransfer(id: String) {
+        // 立即从列表移除并清掉取消标志；Service 端再取消下载线程并删掉该任务的 .part 残余文件。
+        TransferRepository.remove(id)
+        CancelHub.clear(id)
+        DownloadService.remove(getApplication(), id)
+    }
+
     /**
-     * Resume / retry every transfer that is not finished. Delegated to the download service, which
-     * continues from each file's existing `.part` content (断点续传).
+     * Pause every in-flight / queued transfer. Each task keeps its `.part` file and offset, so a
+     * later "续传/重试" resumes from where it stopped. The flag is set here (not only in the
+     * service) so a blocked read loop stops even if the pause intent is dropped.
      */
-    fun resumeDownloads() {
+    fun pauseAllDownloads() {
+        TransferRepository.transfers.value.forEach { t ->
+            if (t.state == TransferState.ACTIVE || t.state == TransferState.QUEUED) {
+                CancelHub.mark(t.id)
+                TransferRepository.patch(t.id) { it.copy(state = TransferState.PAUSED) }
+            }
+        }
+        TransferRepository.persist()
+        DownloadService.pauseAll(getApplication())
+    }
+
+    /**
+     * Resume every paused / failed transfer (断点续传). Clears the cancel flag first so the resumed
+     * task isn't instantly re-paused by the per-chunk check in doRead.
+     */
+    fun resumeAllDownloads() {
+        TransferRepository.transfers.value.forEach { t ->
+            if (t.state == TransferState.PAUSED || t.state == TransferState.FAILED) {
+                CancelHub.clear(t.id)
+                TransferRepository.patch(t.id) { it.copy(state = TransferState.QUEUED, error = null) }
+            }
+        }
+        TransferRepository.persist()
         DownloadService.resume(getApplication(), _connection.value)
     }
 
-    fun cancelTransfer(id: String) {
-        DownloadService.cancel(getApplication(), id)
+    /** Bottom-sheet toggle button: "暂停全部" while downloading, "续传/重试" once paused/failed. */
+    fun toggleAllDownloads() {
+        val anyActive = TransferRepository.transfers.value.any {
+            it.state == TransferState.ACTIVE || it.state == TransferState.QUEUED
+        }
+        if (anyActive) pauseAllDownloads() else resumeAllDownloads()
     }
 
     fun clearTransfers() {
         DownloadService.clear(getApplication())
+    }
+
+    fun clearDoneTransfers() {
+        DownloadService.clearDone(getApplication())
     }
 
     /** Tear down the SMB connection and return to the disconnected (connect-screen) state. */

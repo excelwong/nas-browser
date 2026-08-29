@@ -37,10 +37,10 @@
             android:textColor="@color/grey_600" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnCancel"
+            android:id="@+id/btnDelete"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/cancel_transfer"
+            android:text="@string/delete_transfer"
             android:textSize="12sp"
             style="@style/Widget.MaterialComponents.Button.TextButton" />
     </LinearLayout>

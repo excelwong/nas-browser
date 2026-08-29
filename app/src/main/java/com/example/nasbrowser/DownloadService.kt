@@ -26,11 +26,17 @@ import com.hierynomus.msfscc.fileinformation.FileStandardInformation
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2CreateOptions
 import com.hierynomus.mssmb2.SMB2ShareAccess
+import com.hierynomus.protocol.transport.TransportException
+import com.hierynomus.smbj.common.SMBRuntimeException
 import com.hierynomus.smbj.share.File as SmbjFile
+import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.SocketException
+import java.net.UnknownHostException
 import java.util.EnumSet
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -67,28 +73,27 @@ class DownloadService : Service() {
         private const val READ_BUF = 1024 * 1024
         private const val CHANNEL_ID = "nas_downloads"
         private const val NOTIF_ID = 1001
+        /** Max consecutive transient-network blips before a transfer is given up as FAILED.
+         *  With exponential backoff (300ms..5s, capped), the worst-case wait is roughly 75s — enough
+         *  to ride out wifi roaming / NAS wake-up, but bounded enough to not hang the download. */
+        private const val MAX_NET_RETRIES = 30
+        /** Max consecutive non-network failures before giving up (e.g. permission errors). */
+        private const val MAX_OTHER_FAILS = 10
 
         const val ACTION_ENQUEUE = "com.example.nasbrowser.action.ENQUEUE"
         const val ACTION_CANCEL = "com.example.nasbrowser.action.CANCEL"
+        const val ACTION_REMOVE = "com.example.nasbrowser.action.REMOVE"
         const val ACTION_PAUSE_ALL = "com.example.nasbrowser.action.PAUSE_ALL"
         const val ACTION_RESUME = "com.example.nasbrowser.action.RESUME"
         const val ACTION_CLEAR = "com.example.nasbrowser.action.CLEAR"
+        const val ACTION_CLEAR_DONE = "com.example.nasbrowser.action.CLEAR_DONE"
         const val EXTRA_CONN = "extra_conn"
         const val EXTRA_ID = "extra_id"
 
-        /** Begin (or continue) downloading the enqueued transfers. */
+        /** Begin downloading the enqueued transfers. */
         fun enqueue(context: Context, conn: ConnectionParams?) {
             val intent = Intent(context, DownloadService::class.java).apply {
                 action = ACTION_ENQUEUE
-                if (conn != null) putExtra(EXTRA_CONN, conn)
-            }
-            ContextCompat.startForegroundService(context, intent)
-        }
-
-        /** Resume paused transfers and retry failed ones. */
-        fun resume(context: Context, conn: ConnectionParams?) {
-            val intent = Intent(context, DownloadService::class.java).apply {
-                action = ACTION_RESUME
                 if (conn != null) putExtra(EXTRA_CONN, conn)
             }
             ContextCompat.startForegroundService(context, intent)
@@ -102,20 +107,60 @@ class DownloadService : Service() {
             context.startService(intent)
         }
 
+        /** Cancel a single transfer, drop it from the list, and delete its partial file. */
+        fun remove(context: Context, id: String) {
+            val intent = Intent(context, DownloadService::class.java).apply {
+                action = ACTION_REMOVE
+                putExtra(EXTRA_ID, id)
+            }
+            context.startService(intent)
+        }
+
+        /** Pause every not-yet-finished transfer (download in progress / queued). */
         fun pauseAll(context: Context) {
             val intent = Intent(context, DownloadService::class.java).apply { action = ACTION_PAUSE_ALL }
             context.startService(intent)
+        }
+
+        /** Resume every paused/failed transfer (continues from each .part file). */
+        fun resume(context: Context, conn: ConnectionParams?) {
+            val intent = Intent(context, DownloadService::class.java).apply {
+                action = ACTION_RESUME
+                if (conn != null) putExtra(EXTRA_CONN, conn)
+            }
+            ContextCompat.startForegroundService(context, intent)
         }
 
         fun clear(context: Context) {
             val intent = Intent(context, DownloadService::class.java).apply { action = ACTION_CLEAR }
             context.startService(intent)
         }
+
+        fun clearDone(context: Context) {
+            val intent = Intent(context, DownloadService::class.java).apply { action = ACTION_CLEAR_DONE }
+            context.startService(intent)
+        }
     }
 
     private val executor = Executors.newFixedThreadPool(CONCURRENCY)
     private val futures = ConcurrentHashMap<String, Future<*>>()
-    private val cancelFlags = ConcurrentHashMap<String, AtomicBoolean>()
+    /** Relative paths that currently have a worker writing their `.part` staging file.
+     *
+     * Note this is keyed by *relativePath*, not by transfer id: `partTempFile` names the staging
+     * file after the path, so two transfer items that resolve to the same path (e.g. the same file
+     * selected twice, or a duplicate restored from disk) share ONE `.part` file even though their
+     * ids differ. Two workers on it each seek to their own resume offset and write forward, and
+     * whichever reaches the end first moves the `.part` into Downloads — deleting it — while the
+     * other is still streaming. The survivor then re-opens a fresh, empty `.part` and starts from
+     * zero, so the file visibly grows, collapses and grows again instead of ever settling.
+     *
+     * Guarding on the shared resource (the path) rather than the id is what actually prevents
+     * that. It also closes the window between `submit()` and the moment `downloadOne` flips the
+     * state to ACTIVE, during which a second `startProcessing()` would otherwise still see the
+     * item as QUEUED and hand it to a second worker. */
+    private val activeParts = ConcurrentHashMap.newKeySet<String>()
+    /** Currently-open SMB file handles, keyed by transfer id, so removeOne can force-close them. */
+    private val activeFiles = ConcurrentHashMap<String, SmbjFile>()
 
     /** The download pool. Swapped atomically; never closed out from under an in-flight reader. */
     private val poolRef = AtomicReference<SmbConnectionPool?>(null)
@@ -145,21 +190,16 @@ class DownloadService : Service() {
                 ensureForeground()
                 startProcessing()
             }
+            ACTION_CANCEL -> cancelOne(intent.getStringExtra(EXTRA_ID))
+            ACTION_REMOVE -> removeOne(intent.getStringExtra(EXTRA_ID))
+            ACTION_PAUSE_ALL -> pauseAll()
             ACTION_RESUME -> {
                 lastConn = intent.getParcelableExtra(EXTRA_CONN) ?: lastConn
-                // Re-queue paused transfers and retry failed ones (keep finished ones done).
-                TransferRepository.transfers.value.forEach { t ->
-                    if (t.state == TransferState.FAILED || t.state == TransferState.PAUSED) {
-                        TransferRepository.patch(t.id) { it.copy(state = TransferState.QUEUED, error = null) }
-                    }
-                }
-                TransferRepository.persist()
                 ensureForeground()
-                startProcessing()
+                resumeAll()
             }
-            ACTION_CANCEL -> cancelOne(intent.getStringExtra(EXTRA_ID))
-            ACTION_PAUSE_ALL -> pauseAll()
             ACTION_CLEAR -> clearAll()
+            ACTION_CLEAR_DONE -> clearDone()
             else -> {
                 // Restarted by the system with a null intent, or an unknown action. Resume any
                 // queued work if we can rebuild a connection; otherwise just stop.
@@ -231,25 +271,83 @@ class DownloadService : Service() {
     private fun startProcessing() {
         val pending = TransferRepository.transfers.value.filter { it.state == TransferState.QUEUED }
         for (it in pending) {
-            val task = executor.submit { runCatching { downloadOne(it) } }
+            // Skip if a worker is already writing this path's .part file — see [activeParts].
+            if (!activeParts.add(it.relativePath)) continue
+            val task = executor.submit {
+                try {
+                    runCatching { downloadOne(it) }
+                } finally {
+                    activeParts.remove(it.relativePath)
+                }
+            }
             futures[it.id] = task
         }
         if (pending.isEmpty()) updateNotification()
     }
 
+    /** Release the [activeParts] guard for a transfer's path. Needed because a task cancelled
+     *  while still queued never runs, so its own `finally` would never release it. */
+    private fun releasePath(id: String) {
+        TransferRepository.transfers.value.firstOrNull { it.id == id }
+            ?.let { activeParts.remove(it.relativePath) }
+    }
+
     private fun cancelOne(id: String?) {
         id ?: return
-        cancelFlags[id]?.set(true)
+        // Mark the shared cancel flag immediately. The UI already did this too, but doing it here
+        // keeps the service self-sufficient if it receives the intent before/without the UI.
+        CancelHub.mark(id)
+        // Interrupt the worker thread. smbj's read() ignores this, but it lets the retry-backoff
+        // sleep in doRead() wake up immediately and honour the cancel flag.
         futures[id]?.cancel(true)
-        TransferRepository.markCancelled(id)
+        // A task cancelled while still queued never runs, so its `finally` would never release the
+        // path; drop it here so 继续/重试 can start a fresh worker later.
+        releasePath(id)
+        // Force-close ONLY this task's open SMB file handle (best effort) so a blocked read() fails
+        // fast. We must NOT close the whole download pool here: every parallel download shares that
+        // single pool, so tearing it down would abort ALL of them (the old "pause one, pause all" bug).
+        try { activeFiles.remove(id)?.close() } catch (_: Exception) {}
+        // Update transfer state to PAUSED immediately.
+        TransferRepository.patch(id) { t ->
+            if (t.state == TransferState.ACTIVE || t.state == TransferState.QUEUED)
+                t.copy(state = TransferState.PAUSED) else t
+        }
+        TransferRepository.persist()
         if (foregroundStarted) updateNotification() else stopSelf()
     }
 
+    /**
+     * Cancel one transfer, drop it from the list, and delete whatever partial file it had written.
+     * Only this task's SMB handle is closed — the shared download pool is left intact so other
+     * parallel downloads keep going.
+     */
+    private fun removeOne(id: String?) {
+        id ?: return
+        CancelHub.mark(id)
+        // Stop the worker thread and close its own SMB file handle so a blocked read() fails fast.
+        futures.remove(id)?.cancel(true)
+        releasePath(id)
+        try { activeFiles.remove(id)?.close() } catch (_: Exception) {}
+        // Delete the partial download (the residual content) for this task.
+        try {
+            val item = TransferRepository.transfers.value.firstOrNull { it.id == id }
+            item?.let { partTempFile(application, it.relativePath).delete() }
+        } catch (_: Exception) {}
+        // Remove the task from the list.
+        TransferRepository.remove(id)
+        if (foregroundStarted) updateNotification() else stopSelf()
+    }
+
+    /** Pause every in-flight or queued transfer. Each task keeps its .part file and offset, so a
+     *  later "续传/重试" resumes it from where it stopped. Only that task's own SMB handle is closed
+     *  — the shared pool is left intact. */
     private fun pauseAll() {
         TransferRepository.transfers.value.forEach { t ->
             if (t.state == TransferState.ACTIVE || t.state == TransferState.QUEUED) {
-                cancelFlags[t.id]?.set(true)
+                CancelHub.mark(t.id)
                 futures[t.id]?.cancel(true)
+                activeParts.remove(t.relativePath)
+                try { activeFiles.remove(t.id)?.close() } catch (_: Exception) {}
                 TransferRepository.patch(t.id) { it.copy(state = TransferState.PAUSED) }
             }
         }
@@ -257,10 +355,27 @@ class DownloadService : Service() {
         if (foregroundStarted) updateNotification() else stopSelf()
     }
 
+    /** Resume every paused/failed transfer (断点续传). Clears any stale cancel flags so a resumed
+     *  task isn't instantly re-paused by the per-chunk check in doRead. */
+    private fun resumeAll() {
+        TransferRepository.transfers.value.forEach { t ->
+            if (t.state == TransferState.PAUSED || t.state == TransferState.FAILED) {
+                CancelHub.clear(t.id)
+                TransferRepository.patch(t.id) { it.copy(state = TransferState.QUEUED, error = null) }
+            }
+        }
+        TransferRepository.persist()
+        startProcessing()
+    }
+
     private fun clearAll() {
         futures.values.forEach { try { it.cancel(true) } catch (_: Exception) {} }
         futures.clear()
-        cancelFlags.clear()
+        // A task that was still queued never runs, so its own `finally` never releases its path.
+        // Drop every guard here, and delete the .part files too, or re-downloading the same file
+        // later would be silently skipped as "already being written" and never start.
+        activeParts.clear()
+        CancelHub.clearAll()
         val root = application.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
         root?.let { java.io.File(it, ".nasparts").deleteRecursively() }
         closeQuietly(poolRef.getAndSet(null))
@@ -270,12 +385,29 @@ class DownloadService : Service() {
         stopSelf()
     }
 
+    private fun clearDone() {
+        futures.values.forEach { try { it.cancel(true) } catch (_: Exception) {} }
+        futures.clear()
+        // Same reasoning as clearAll(): a queued-but-never-started task would otherwise leave its
+        // path guarded forever, blocking any future download of that file.
+        activeParts.clear()
+        CancelHub.clearAll()
+        TransferRepository.clearDone()
+        if (foregroundStarted) updateNotification() else stopSelf()
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Per-file download
     // ---------------------------------------------------------------------------------------------
     private fun downloadOne(item: TransferItem) {
-        val cancel = cancelFlags.getOrPut(item.id) { AtomicBoolean(false) }
-        cancel.set(false)
+        val cancel = CancelHub.flagFor(item.id)
+        // If already cancelled (e.g. user tapped 删除 before this task started), don't begin.
+        if (cancel.get()) {
+            TransferRepository.patch(item.id) { it.copy(state = TransferState.FAILED, error = "已取消", bytes = tempLen(item)) }
+            TransferRepository.persist()
+            updateNotification()
+            return
+        }
         TransferRepository.patch(item.id) { it.copy(state = TransferState.ACTIVE, error = null) }
 
         var wasCancelled = false
@@ -288,27 +420,38 @@ class DownloadService : Service() {
             wasCancelled = true
             false
         } catch (e: Exception) {
-            lastErr = e.message ?: "下载失败"
+            lastErr = friendlyError(e)
             false
         }
 
         var ok = runOnce()
+
+        // If the pool was closed by cancelOne, skip retry entirely.
+        if (!ok && cancel.get()) {
+            wasCancelled = true
+        }
+
+        // Only retry if not cancelled and first attempt failed (stale SMB session handling).
         if (!ok && !wasCancelled) {
-            // Stale SMB session — mark the current pool stale so a single thread rebuilds it, then
-            // retry once with the (re)built pool. Other threads that also saw the stale pool will
-            // simply reuse this rebuild instead of racing to recreate it.
             val p = poolRef.get()
             if (p != null) poolRef.compareAndSet(p, null)
             ensurePool(p)
             ok = runOnce()
+            // After retry, check cancel flag again.
+            if (cancel.get()) {
+                wasCancelled = true
+            }
         }
 
         when {
             wasCancelled -> TransferRepository.patch(item.id) {
                 it.copy(state = TransferState.PAUSED, bytes = tempLen(item))
             }
+            // Deliberately leaves `bytes` alone: doRead's last progress patch already holds the
+            // real delivered size. Overwriting it with `item.size` — a snapshot taken when this
+            // task was enqueued — would make the bar jump at the very moment it completes.
             ok -> TransferRepository.patch(item.id) {
-                it.copy(state = TransferState.DONE, bytes = item.size, error = null)
+                it.copy(state = TransferState.DONE, error = null)
             }
             else -> TransferRepository.patch(item.id) {
                 it.copy(state = TransferState.FAILED, error = lastErr ?: "下载失败", bytes = tempLen(item))
@@ -351,67 +494,222 @@ class DownloadService : Service() {
     }
 
     /**
+     * Throw [CancelledException] if this task was cancelled or its thread was interrupted.
+     *
+     * `Thread.interrupted()` clears the interrupt flag as a side effect, so it has to be evaluated
+     * on every call. Writing the test as `cancel.get() || Thread.interrupted()` short-circuits: on
+     * a cancel the flag is left set, and because the executor reuses threads the next task to land
+     * on that thread would see a stale interrupt and abort instantly.
+     */
+    private fun checkCancelled(cancel: AtomicBoolean) {
+        val interrupted = Thread.interrupted()
+        if (cancel.get() || interrupted) throw CancelledException()
+    }
+
+    /**
      * Read a single file's bytes into its `.part` staging file, resuming from any existing partial
      * content. Returns true on success; throws [CancelledException] if cancelled mid-way or another
      * exception (e.g. a stale SMB session) on failure.
+     *
+     * Two invariants keep a resume from drifting:
+     *  - The write offset is ALWAYS re-derived from the real length of the `.part` file on disk at
+     *    the start of every attempt — never carried over in memory from a previous attempt, so a
+     *    reconnect can't resume from a stale cursor.
+     *  - Every chunk is fetched with an ABSOLUTE-offset SMB READ (`file.read(buf, offset)`) rather
+     *    than a sequential stream positioned by `skip(offset)`. smbj's `FileInputStream.skip`
+     *    returns the requested `n` unconditionally (verified: the method ends in `lload_1;
+     *    lreturn`), so a caller can never tell whether the cursor actually landed where it asked —
+     *    and it works by mutating an internal cursor plus discarding the read-ahead buffer. Stating
+     *    the absolute offset on *every* request removes that state from the picture entirely: an
+     *    interrupted transfer always continues from the byte right after the last one written.
+     *
+     * Network blips (wifi stalls, NAS wake-ups, broken pipes, timeouts) are NOT treated as fatal:
+     * the affected file handle is closed, the SMB pool is rebuilt, and the read resumes from the
+     * last good offset. The user only sees a brief "网络中断 重试中" hint on the transfer item.
+     * Only after [MAX_NET_RETRIES] consecutive network blips does the transfer fall back to FAILED.
      */
     private fun doRead(item: TransferItem, cancel: AtomicBoolean): Boolean {
-        val p = ensurePool() ?: throw IllegalStateException("尚未连接")
         val share = item.share ?: throw IllegalStateException("缺少共享名")
         val tempFile = partTempFile(application, item.relativePath)
         val parent = item.relativePath.substringBeforeLast('/')
         val mime = guessMime(item.path)
-        p.withShare(share) { ds ->
-            val remoteSize = try {
-                ds.getFileInformation(toSmbPath(item.path), FileStandardInformation::class.java).endOfFile
-            } catch (e: Exception) {
-                item.size
-            }
-
-            val existing = if (tempFile.exists()) tempFile.length() else 0L
-            // Already fully downloaded but interrupted before the final move? Just move it.
-            if (remoteSize > 0 && existing >= remoteSize) {
-                movePartToDownloads(application, tempFile, item.name, parent, mime)
-            } else {
-                val startOffset = if (remoteSize > 0 && existing in 1 until remoteSize) existing else 0L
-                var raf: RandomAccessFile? = null
-                var file: SmbjFile? = null
+        val raf = RandomAccessFile(tempFile, "rw")
+        try {
+            var netRetries = 0
+            var otherFails = 0
+            outer@ while (true) {
+                checkCancelled(cancel)
+                val p = ensurePool()
+                if (p == null) {
+                    if (cancel.get()) throw CancelledException()
+                    Thread.sleep(1000)
+                    continue@outer
+                }
+                // Authoritative resume point: whatever is really on disk right now.
+                var offset = raf.length()
+                var ds: com.hierynomus.smbj.share.DiskShare? = null
                 try {
-                    raf = RandomAccessFile(tempFile, "rw")
-                    raf.seek(startOffset)
-                    file = ds.openFile(
-                        toSmbPath(item.path),
-                        EnumSet.of(AccessMask.GENERIC_READ),
-                        EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
-                        EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
-                        SMB2CreateDisposition.FILE_OPEN,
-                        EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
-                    )
-                    val buf = ByteArray(READ_BUF)
-                    var offset = startOffset
-                    var lastReport = startOffset
-                    while (true) {
-                        if (cancel.get()) throw CancelledException()
-                        val n = file.read(buf, offset)
-                        if (n <= 0) break
-                        raf.write(buf, 0, n)
-                        offset += n
-                        if (offset - lastReport >= 256 * 1024) {
-                            lastReport = offset
-                            TransferRepository.patch(item.id) { it.copy(bytes = offset) }
-                        }
+                    ds = p.acquireShare(share)
+                    // The server's own end-of-file is the only trustworthy completion threshold.
+                    // item.size comes from an earlier directory listing and can be stale or 0; using
+                    // it as the gate lets a *partial* .part be declared complete, moved into the
+                    // public Download folder and then re-downloaded from zero — the file size
+                    // apparently bouncing up and down instead of settling.
+                    var remoteSize = 0L
+                    try {
+                        remoteSize = ds.getFileInformation(
+                            toSmbPath(item.path),
+                            FileStandardInformation::class.java
+                        ).endOfFile
+                    } catch (_: Exception) { /* fall back to item.size below */ }
+                    if (remoteSize <= 0) remoteSize = item.size
+
+                    if (remoteSize > 0 && offset >= remoteSize) {
+                        // Already complete (e.g. we crashed mid-final-move on a previous run):
+                        // deliver it and finish — never re-download.
+                        TransferRepository.patch(item.id) { it.copy(bytes = remoteSize, error = null) }
+                        // raf is deliberately NOT closed here: RandomAccessFile is unbuffered, so the
+                        // bytes are already on disk, and keeping it open means a retry can still ask
+                        // for raf.length(). The outer finally closes it on every exit path.
+                        if (!movePartToDownloads(application, tempFile, item.name, parent, mime))
+                            throw IOException("写入下载目录失败")
+                        return true
                     }
-                    TransferRepository.patch(item.id) { it.copy(bytes = offset) }
-                    try { file.close() } catch (_: Exception) {}
-                    try { raf.close() } catch (_: Exception) {}
-                    movePartToDownloads(application, tempFile, item.name, parent, mime)
+                    // ---- Inner read loop (one attempt; on error, outer rebuilds and retries) ----
+                    var file: SmbjFile? = null
+                    var lastReport = offset
+                    var lastReportAt = 0L
+                    try {
+                        file = ds.openFile(
+                            toSmbPath(item.path),
+                            EnumSet.of(AccessMask.GENERIC_READ),
+                            EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                            EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
+                            SMB2CreateDisposition.FILE_OPEN,
+                            EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
+                        )
+                        activeFiles[item.id] = file
+                        val buf = ByteArray(READ_BUF)
+                        while (true) {
+                            checkCancelled(cancel)
+                            // Absolute-offset READ: no stream cursor, no skip(), no drift.
+                            val n = file.read(buf, offset)
+                            if (n <= 0) break
+                            raf.seek(offset)
+                            raf.write(buf, 0, n)
+                            offset += n
+                            // Real progress resets both budgets, so only *consecutive* failures
+                            // count toward the limits (netRetries used to leak across the whole
+                            // transfer, so a long download over flaky wifi eventually gave up).
+                            netRetries = 0
+                            otherFails = 0
+                            val now = System.currentTimeMillis()
+                            if (offset - lastReport >= 256 * 1024 && now - lastReportAt >= 500) {
+                                lastReport = offset
+                                lastReportAt = now
+                                TransferRepository.patch(item.id) { it.copy(bytes = offset, error = null) }
+                            }
+                        }
+                        // Reaching EOF short of the server's size means the transfer ended early —
+                        // never deliver a truncated file as "done"; let the retry path resume it.
+                        // This is what a dropped connection actually looks like from here, so it
+                        // must be classified as a network blip (SocketException), otherwise it
+                        // falls into the non-transient branch: three 300 ms retries and then a
+                        // permanent FAILED, so every network hiccup would end the transfer
+                        // instead of resuming it.
+                        if (remoteSize > 0 && offset < remoteSize)
+                            throw SocketException("连接提前结束（${offset}/${remoteSize}）")
+                        // Success.
+                        TransferRepository.patch(item.id) { it.copy(bytes = offset, error = null) }
+                        try { file.close() } catch (_: Exception) {}
+                        file = null
+                        if (!movePartToDownloads(application, tempFile, item.name, parent, mime))
+                            throw IOException("写入下载目录失败")
+                        return true
+                    } finally {
+                        activeFiles.remove(item.id)
+                        try { file?.close() } catch (_: Exception) {}
+                    }
+                } catch (e: CancelledException) {
+                    throw e
+                } catch (e: Exception) {
+                    checkCancelled(cancel)
+                    if (isTransientNetwork(e)) {
+                        if (++netRetries > MAX_NET_RETRIES) throw e
+                        showNetRetry(item.id, netRetries)
+                        try { raf.seek(offset) } catch (_: Exception) {}
+                        // Rebuild the SMB pool so the next acquireShare gets fresh sessions.
+                        val stale = poolRef.getAndSet(null)
+                        closeQuietly(stale)
+                        try { Thread.sleep(netBackoffMs(netRetries)) } catch (_: InterruptedException) {
+                            if (cancel.get()) throw CancelledException()
+                        }
+                        continue@outer
+                    }
+                    // Non-network failure: small bounded retry, then bubble up to FAILED.
+                    if (++otherFails > MAX_OTHER_FAILS) throw e
+                    try { raf.seek(offset) } catch (_: Exception) {}
+                    try { Thread.sleep(300) } catch (_: InterruptedException) {
+                        if (cancel.get()) throw CancelledException()
+                    }
+                    continue@outer
                 } finally {
-                    try { file?.close() } catch (_: Exception) {}
-                    try { raf?.close() } catch (_: Exception) {}
+                    // Another thread's network blip may have torn down (and closed) this pool
+                    // while we were using it. A throw from here would replace the real exception
+                    // with a pool-closed error and send the retry logic down the wrong branch.
+                    try { ds?.let { p.releaseShare(share, it) } } catch (_: Exception) {}
                 }
             }
+        } finally {
+            try { raf.close() } catch (_: Exception) {}
         }
+        @Suppress("UNREACHABLE_CODE")
         return true
+    }
+
+    private fun isTransientNetwork(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        val seen = HashSet<Throwable>()
+        while (cur != null && seen.add(cur)) {
+            if (cur is CancelledException) return false
+            if (cur is java.util.concurrent.CancellationException) return false
+            when {
+                cur is TimeoutException -> return true
+                cur is SocketException -> return true
+                cur is UnknownHostException -> return true
+                cur is SMBRuntimeException -> return true
+                cur is TransportException -> return true
+                cur is IOException -> {
+                    val m = cur.message ?: ""
+                    if (m.contains("Broken pipe", true) ||
+                        m.contains("Connection reset", true) ||
+                        m.contains("Connection closed", true) ||
+                        m.contains("Connection aborted", true) ||
+                        m.contains("Software caused connection abort", true) ||
+                        m.contains("Read timed out", true) ||
+                        m.contains("Unexpected end of stream", true)) return true
+                }
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun netBackoffMs(retry: Int): Long {
+        // 300, 600, 1200, 2400, 4800, 5000... (capped at 5s). retry starts at 1.
+        val shift = (retry - 1).coerceAtLeast(0).coerceAtMost(4)
+        return (300L shl shift).coerceAtMost(5000L)
+    }
+
+    /** Update the transfer item's transient status to indicate an active network retry. */
+    private fun showNetRetry(itemId: String, retry: Int) {
+        TransferRepository.patch(itemId) { it.copy(error = "网络中断 重试中 ($retry)") }
+    }
+
+    private fun friendlyError(e: Throwable): String {
+        if (isTransientNetwork(e)) return "网络中断"
+        val msg = e.message ?: e.javaClass.simpleName
+        return if (msg.length > 60) msg.substring(0, 60) + "…" else msg
     }
 
     private fun toSmbPath(p: String): String = p.replace('/', '\\').trim('\\')

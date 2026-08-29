@@ -39,18 +39,27 @@ class SmbConnectionPool(
         // drastically cuts round-trips (and therefore transfer time) over high-latency links.
         .withReadBufferSize(4 * 1024 * 1024)
         .withWriteBufferSize(4 * 1024 * 1024)
-        .withTimeout(30, TimeUnit.SECONDS)
+        // Per-request timeout. This used to be 3s to bound how long a cancel took to bite, but a
+        // NAS waking a spun-down disk (or a brief wifi stall) easily exceeds that, and every such
+        // timeout costs a failed request + backoff + re-read — i.e. it made transfers SLOWER.
+        // Cancellation no longer depends on it: the transfer is dropped from the list instantly and
+        // the worker stops via the per-chunk cancel flag plus a forced close of its file handle.
+        .withTimeout(20, TimeUnit.SECONDS)
         .build()
 
     private val client = SMBClient(config)
     private val queues = mutableMapOf<String, LinkedBlockingQueue<DiskShare>>()
     private val queuesLock = Any()
     private val created = mutableListOf<Pair<Session, Connection>>()
+    /** Track all DiskShare objects ever created, including borrowed ones, for forced close. */
+    private val allShares = mutableListOf<DiskShare>()
+    private val allSharesLock = Any()
 
     private fun getQueue(share: String): LinkedBlockingQueue<DiskShare> = synchronized(queuesLock) {
         queues[share] ?: run {
             val q = LinkedBlockingQueue<DiskShare>(size)
             repeat(size) { q.add(createShare(share)) }
+            synchronized(allSharesLock) { allShares.addAll(q.toList()) }
             queues[share] = q
             q
         }
@@ -76,15 +85,36 @@ class SmbConnectionPool(
         }
     }
 
+    /** Acquire a share without the auto-release scope; pair with [releaseShare] once done. Use this
+     *  when the caller's recovery logic needs to throw out of the borrow scope (e.g. network
+     *  errors that should rebuild the pool and retry). */
+    fun acquireShare(share: String): DiskShare = getQueue(share).take()
+
+    fun releaseShare(share: String, ds: DiskShare) {
+        val q = synchronized(queuesLock) { queues[share] } ?: run {
+            try { ds.close() } catch (_: Exception) {}
+            return
+        }
+        // If the pool was closed (queue cleared mid-flight), drop the share rather than re-queueing.
+        if (!q.offer(ds)) {
+            try { ds.close() } catch (_: Exception) {}
+        }
+    }
+
     fun close() {
+        synchronized(allSharesLock) {
+            allShares.toList().forEach { ds -> try { ds.close() } catch (_: Exception) {} }
+            allShares.clear()
+        }
         queues.values.forEach { q ->
-            q.toList().forEach { ds -> try { ds.close() } catch (_: Exception) {} }
+            q.clear()
         }
         queues.clear()
         created.forEach { (session, conn) ->
             try { session.close() } catch (_: Exception) {}
             try { conn.close() } catch (_: Exception) {}
         }
+        created.clear()
         try { client.close() } catch (_: Exception) {}
     }
 }

@@ -21,10 +21,27 @@
             android:textStyle="bold" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnResumeAll"
+            android:id="@+id/btnClose"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/resume_all"
+            android:text="@string/close"
+            android:textSize="12sp"
+            style="@style/Widget.MaterialComponents.Button.TextButton" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnToggleAll"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/pause_all"
             android:textSize="12sp"
             style="@style/Widget.MaterialComponents.Button.TextButton" />
 
@@ -37,10 +54,10 @@
             style="@style/Widget.MaterialComponents.Button.TextButton" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnClose"
+            android:id="@+id/btnClearDone"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/close"
+            android:text="@string/clear_done"
             android:textSize="12sp"
             style="@style/Widget.MaterialComponents.Button.TextButton" />
     </LinearLayout>

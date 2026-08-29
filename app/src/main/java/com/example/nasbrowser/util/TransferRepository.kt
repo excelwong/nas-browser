@@ -32,8 +32,26 @@ object TransferRepository {
         if (loaded) return
         val list = TransferStore.load(application)
         // Anything not finished is resumable after a restart: normalize to QUEUED.
-        _transfers.value = list.map { t ->
+        val normalized = list.map { t ->
             if (t.state != TransferState.DONE) t.copy(state = TransferState.QUEUED, error = null) else t
+        }
+        // Also drop duplicate paths that may already be sitting in the saved list from an older
+        // build: two items for one path share a single .part file and would fight over it. The
+        // first occurrence wins.
+        val seen = mutableSetOf<String>()
+        // The saved `bytes` is stale: persist() deliberately skips byte-progress updates, so it
+        // still holds whatever was current at the last *state* change — often 0. Showing that
+        // after a restart makes the completion rate collapse to 0% and then jump back up as soon
+        // as doRead reports real progress, which looks like the download bouncing up and down.
+        // The .part file on disk is the only trustworthy record of how much we actually have.
+        _transfers.value = normalized.filter { seen.add(it.path) }.map { t ->
+            if (t.state == TransferState.DONE) t
+            else {
+                val have = try {
+                    partTempFile(application, t.relativePath).let { if (it.exists()) it.length() else 0L }
+                } catch (_: Exception) { 0L }
+                if (have > t.bytes) t.copy(bytes = have) else t
+            }
         }
         loaded = true
     }
@@ -43,11 +61,21 @@ object TransferRepository {
         persist()
     }
 
-    /** Add [items] that are not already present (matched by remote path). Used when enqueuing. */
+    /** Add [items] that are not already present (matched by remote path). Used when enqueuing.
+     * Skips items whose path already exists in the list, regardless of state,
+     * to prevent duplicate entries. */
     fun enqueueNew(items: List<TransferItem>) {
         synchronized(lock) {
-            val have = _transfers.value.map { it.path }.toSet()
-            val fresh = items.filter { it.path !in have }
+            val seen = _transfers.value.mapTo(mutableSetOf()) { it.path }
+            val fresh = ArrayList<TransferItem>(items.size)
+            for (it in items) {
+                // De-duplicate against the existing list AND within this batch. `seen.add` is
+                // checked as we go, so a path repeated inside `items` is still only taken once —
+                // the old `filter` compared every candidate against the list as it was *before*
+                // the batch, so the same file selected twice slipped in as two items (different
+                // ids, same path) that then shared one .part file.
+                if (seen.add(it.path)) fresh.add(it)
+            }
             if (fresh.isNotEmpty()) _transfers.value = _transfers.value + fresh
         }
         persist()
@@ -79,6 +107,20 @@ object TransferRepository {
 
     fun clear() {
         synchronized(lock) { _transfers.value = emptyList() }
+        persist()
+    }
+
+    /** Remove a single transfer by id (used when the user deletes a task). */
+    fun remove(id: String) {
+        synchronized(lock) { _transfers.value = _transfers.value.filter { it.id != id } }
+        persist()
+    }
+
+    /** Remove only transfers that have reached DONE state. */
+    fun clearDone() {
+        synchronized(lock) {
+            _transfers.value = _transfers.value.filter { it.state != TransferState.DONE }
+        }
         persist()
     }
 

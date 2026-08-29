@@ -22,9 +22,11 @@
     <string name="empty_folder">此目录为空</string>
     <string name="transfers_title">传输列表</string>
     <string name="close">关闭</string>
-    <string name="resume_all">继续/重试</string>
     <string name="clear_transfers">清空</string>
-    <string name="cancel_transfer">取消</string>
+    <string name="clear_done">清除已完成</string>
+    <string name="delete_transfer">删除</string>
+    <string name="pause_all">暂停全部</string>
+    <string name="resume_all">续传/重试</string>
     <string name="open_transfers">传输 %1$d/%2$d</string>
     <string name="download_done">下载完成</string>
     <string name="download_failed">部分文件下载失败</string>

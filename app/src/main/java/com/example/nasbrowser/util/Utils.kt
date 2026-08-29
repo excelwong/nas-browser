@@ -23,6 +23,9 @@ fun partTempFile(context: Context, relativePath: String): File {
     return f
 }
 
+/** Buffer used for the final local move; large enough to stay at streaming speed. */
+private const val COPY_BUF = 1024 * 1024
+
 /** Move a completed .part file into the public Download directory. Returns true on success. */
 fun movePartToDownloads(
     context: Context,
@@ -73,8 +76,11 @@ private fun mediaStoreMove(
     }
     val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
     return try {
+        // A finished download still has to be copied into the public Download folder, which is a
+        // full extra pass over the file. A 1 MB buffer keeps that pass at streaming speed instead
+        // of paying per-syscall overhead every 64 KB.
         resolver.openOutputStream(uri)?.use { os ->
-            partFile.inputStream().use { it.copyTo(os, 64 * 1024) }
+            partFile.inputStream().use { it.copyTo(os, COPY_BUF) }
         }
         values.clear()
         values.put(MediaStore.Downloads.IS_PENDING, 0)
@@ -92,9 +98,13 @@ private fun legacyMove(context: Context, partFile: File, name: String, parent: S
     val dir = if (parent.isEmpty()) root else File(root, parent)
     if (!dir.exists()) dir.mkdirs()
     val out = File(dir, name)
+    // Staging file and destination sit on the same volume, so a rename is instant and skips the
+    // whole copy. Fall back to copying if the rename is refused.
+    if (out.exists()) out.delete()
+    if (partFile.renameTo(out)) return true
     return try {
         partFile.inputStream().use { inp ->
-            out.outputStream().use { inp.copyTo(it, 64 * 1024) }
+            out.outputStream().use { inp.copyTo(it, COPY_BUF) }
         }
         partFile.delete()
         true
@@ -131,9 +141,14 @@ fun guessMime(path: String): String {
     }
 }
 
+private const val BYTES_PER_M = 1024.0 * 1024.0
+
+/** File sizes are always shown in megabytes (1 M = 1024 * 1024 bytes) with two decimals, so that
+ *  every row of a directory listing and both sides of a download progress share one scale instead
+ *  of each row picking its own unit. A non-empty file below 0.01 M is clamped up to 0.01 M so it
+ *  never reads as "0.00 M". */
 fun formatSize(bytes: Long): String {
-    if (bytes <= 0) return "0 B"
-    val units = arrayOf("B", "KB", "MB", "GB", "TB")
-    val i = minOf(units.size - 1, (kotlin.math.ln(bytes.toDouble()) / kotlin.math.ln(1024.0)).toInt())
-    return String.format(Locale.US, "%.1f %s", bytes / Math.pow(1024.0, i.toDouble()), units[i])
+    val mb = bytes.coerceAtLeast(0) / BYTES_PER_M
+    val shown = if (bytes > 0 && mb < 0.01) 0.01 else mb
+    return String.format(Locale.US, "%.2f M", shown)
 }
