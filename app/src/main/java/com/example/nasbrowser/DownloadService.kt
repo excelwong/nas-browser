@@ -171,6 +171,9 @@ class DownloadService : Service() {
 
     private var foregroundStarted = false
 
+    /** 状态栏进度条已发出过的最大百分比（只增不减，见 updateNotification）。 */
+    private var notifPct = 0
+
     private lateinit var nm: NotificationManager
 
     private class CancelledException : Exception()
@@ -187,6 +190,14 @@ class DownloadService : Service() {
         when (action) {
             ACTION_ENQUEUE -> {
                 lastConn = intent.getParcelableExtra(EXTRA_CONN) ?: lastConn
+                // 只有「全新的一批」才把状态栏进度归零：往进行中的批次里追文件时
+                // 若归零，5/5=100% → 0/7 会肉眼回跳（与 updateNotification 的
+                // 只增不减策略配套）。
+                if (TransferRepository.transfers.value.none {
+                        it.state == TransferState.ACTIVE || it.state == TransferState.QUEUED
+                    }) {
+                    notifPct = 0
+                }
                 ensureForeground()
                 startProcessing()
             }
@@ -255,7 +266,12 @@ class DownloadService : Service() {
             total > 0 && done == total -> "全部完成 $done/$total"
             else -> "传输列表 $done/$total"
         }
-        nm.notify(NOTIF_ID, buildNotification(text, done, total))
+        // 进度条只增不减：下载中途再选一批文件会让 total 变大，done/total 的比例
+        // 随之回退（5/5=100% → 5/12=42%），状态栏进度条肉眼可见地往回跳。
+        // 记住发过的最大百分比，文字说明仍实时反映真实 done/total。
+        val pct = if (total > 0) done * 100 / total else 0
+        if (pct > notifPct) notifPct = pct
+        nm.notify(NOTIF_ID, buildNotification(text, 100, notifPct))
         // Stop the service once there is nothing left to actively do.
         val anyPending = list.any { it.state == TransferState.ACTIVE || it.state == TransferState.QUEUED }
         if (!anyPending) {
@@ -403,7 +419,11 @@ class DownloadService : Service() {
         val cancel = CancelHub.flagFor(item.id)
         // If already cancelled (e.g. user tapped 删除 before this task started), don't begin.
         if (cancel.get()) {
-            TransferRepository.patch(item.id) { it.copy(state = TransferState.FAILED, error = "已取消", bytes = tempLen(item)) }
+            // 钳制：.part 可能已被搬走/删除，tempLen 此时是 0，直接赋值会让进度条塌回 0
+            TransferRepository.patch(item.id) {
+                it.copy(state = TransferState.FAILED, error = "已取消",
+                        bytes = maxOf(it.bytes, tempLen(item)))
+            }
             TransferRepository.persist()
             updateNotification()
             return
@@ -433,9 +453,12 @@ class DownloadService : Service() {
 
         // Only retry if not cancelled and first attempt failed (stale SMB session handling).
         if (!ok && !wasCancelled) {
-            val p = poolRef.get()
-            if (p != null) poolRef.compareAndSet(p, null)
-            ensurePool(p)
+            // ⚠️ 不要在这里强行拆掉共享池（旧代码：CAS 成 null 再 ensurePool(stale)  close 它）。
+            // 4 个下载共用同一根池子，关掉会让另外 3 个的在途 read 全部失败、集体走一遍
+            // 「重建 + 重试」，表现为所有条目同时闪"网络中断 重试中"、进度肉眼可见地反复跳。
+            // doRead 内部每一轮 attempt 都会 ensurePool() 并在失败时自愈，这里只要保证
+            // 池子存在就够了；真的需要重建时由 doRead 的异常分支精准拆除。
+            ensurePool()
             ok = runOnce()
             // After retry, check cancel flag again.
             if (cancel.get()) {
@@ -444,8 +467,11 @@ class DownloadService : Service() {
         }
 
         when {
+            // 钳制 tempLen：取消/暂停发生时 .part 可能刚被搬进 Downloads（长度为 0），
+            // 不钳制会把已经跑完的进度一夜打回 0%。
             wasCancelled -> TransferRepository.patch(item.id) {
-                it.copy(state = TransferState.PAUSED, bytes = tempLen(item))
+                it.copy(state = TransferState.PAUSED,
+                        bytes = maxOf(it.bytes, tempLen(item)))
             }
             // Deliberately leaves `bytes` alone: doRead's last progress patch already holds the
             // real delivered size. Overwriting it with `item.size` — a snapshot taken when this
@@ -454,7 +480,8 @@ class DownloadService : Service() {
                 it.copy(state = TransferState.DONE, error = null)
             }
             else -> TransferRepository.patch(item.id) {
-                it.copy(state = TransferState.FAILED, error = lastErr ?: "下载失败", bytes = tempLen(item))
+                it.copy(state = TransferState.FAILED, error = lastErr ?: "下载失败",
+                        bytes = maxOf(it.bytes, tempLen(item)))
             }
         }
         TransferRepository.persist()
@@ -567,7 +594,7 @@ class DownloadService : Service() {
                     if (remoteSize > 0 && offset >= remoteSize) {
                         // Already complete (e.g. we crashed mid-final-move on a previous run):
                         // deliver it and finish — never re-download.
-                        TransferRepository.patch(item.id) { it.copy(bytes = remoteSize, error = null) }
+                        TransferRepository.patchProgress(item.id, remoteSize)
                         // raf is deliberately NOT closed here: RandomAccessFile is unbuffered, so the
                         // bytes are already on disk, and keeping it open means a retry can still ask
                         // for raf.length(). The outer finally closes it on every exit path.
@@ -607,7 +634,7 @@ class DownloadService : Service() {
                             if (offset - lastReport >= 256 * 1024 && now - lastReportAt >= 500) {
                                 lastReport = offset
                                 lastReportAt = now
-                                TransferRepository.patch(item.id) { it.copy(bytes = offset, error = null) }
+                                TransferRepository.patchProgress(item.id, offset)
                             }
                         }
                         // Reaching EOF short of the server's size means the transfer ended early —
@@ -620,7 +647,7 @@ class DownloadService : Service() {
                         if (remoteSize > 0 && offset < remoteSize)
                             throw SocketException("连接提前结束（${offset}/${remoteSize}）")
                         // Success.
-                        TransferRepository.patch(item.id) { it.copy(bytes = offset, error = null) }
+                        TransferRepository.patchProgress(item.id, offset)
                         try { file.close() } catch (_: Exception) {}
                         file = null
                         if (!movePartToDownloads(application, tempFile, item.name, parent, mime))

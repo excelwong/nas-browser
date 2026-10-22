@@ -96,6 +96,37 @@ object TransferRepository {
         }
     }
 
+    /**
+     * Report delivered bytes for a transfer — the **only** sanctioned way to move progress
+     * forward. Monotonic by construction: a value that is not greater than what is already
+     * recorded is dropped, so no writer (retry re-deriving an offset, `tempLen()` reading a
+     * `.part` that was just moved away, a stale snapshot after process death) can ever make
+     * the UI's progress bar jump backwards.
+     *
+     * Why this exists: the download engine has several legitimate reasons to compute a byte
+     * count that is *lower* than the one already shown — e.g. pausing in the window between
+     * "final bytes reported" and "`.part` moved into Downloads" reads a length of 0, and a
+     * retry after a network blip re-derives the offset from disk which can lag the last
+     * report by up to one 256 KB chunk. Each of those used to be written verbatim, and the
+     * bar visibly bounced (5% -> 47% -> 5% -> ...) on a flaky wifi.
+     *
+     * Also clears the transient "网络中断 重试中" hint: forward progress means the network
+     * recovered. State/error changes that must be able to move either way still go through
+     * [patch].
+     */
+    fun patchProgress(id: String, bytes: Long) {
+        synchronized(lock) {
+            val cur = _transfers.value
+            val i = cur.indexOfFirst { it.id == id }
+            if (i < 0) return
+            val t = cur[i]
+            if (bytes <= t.bytes) return          // 只许前进
+            val list = cur.toMutableList()
+            list[i] = t.copy(bytes = bytes, error = null)
+            _transfers.value = list
+        }
+    }
+
     /** Mark a transfer cancelled/paused (only if it was actively running or queued). */
     fun markCancelled(id: String) {
         patch(id) { t ->

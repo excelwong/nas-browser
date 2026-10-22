@@ -22,6 +22,7 @@ object TransferStore {
                 o.put("id", it.id)
                 o.put("name", it.name)
                 o.put("path", it.path)
+                o.put("share", it.share ?: "")
                 o.put("relativePath", it.relativePath)
                 o.put("size", it.size)
                 o.put("bytes", it.bytes)
@@ -55,6 +56,9 @@ object TransferStore {
                         id = o.getString("id"),
                         name = o.getString("name"),
                         path = o.getString("path"),
+                        // 旧版本没持久化 share，缺失时按 null 处理（doRead 会报「缺少共享名」，
+                        // 而不是静默连到错误的共享上）。
+                        share = o.optString("share").ifBlank { null },
                         relativePath = o.getString("relativePath"),
                         size = o.getLong("size"),
                         bytes = o.getLong("bytes"),
